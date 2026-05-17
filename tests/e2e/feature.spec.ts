@@ -22,7 +22,7 @@ test("A proposes a trade by scanning B's payload; B sees the offer and accepts â
 
     await b.locator(".mesh-qrx-payload summary").click();
     const bp = (await b.locator(".mesh-qrx-payload code").textContent()) ?? "";
-    await a.getByPlaceholder("or paste a mesh:// payload").fill(bp);
+    await a.getByPlaceholder("or paste a payload (URL or mesh://)").fill(bp);
     await a.getByRole("button", { name: "use", exact: true }).click();
 
     await expect(b.locator(".tc-offers")).toContainText("offers their");
