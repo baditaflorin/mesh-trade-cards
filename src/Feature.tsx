@@ -9,7 +9,16 @@ import {
 
 type Props = { room: YRoom | null; config: MeshConfig };
 type Holding = { cardId: number; name: string };
-type TradeOffer = { from: string; to: string; ts: number };
+// A trade is a pending, two-sided agreement between peers `a` and `b`
+// (a < b lexicographically). It only swaps when BOTH have confirmed.
+type Trade = {
+  a: string;
+  b: string;
+  confirmA: boolean;
+  confirmB: boolean;
+  ts: number;
+  done?: boolean;
+};
 
 const NAME_KEY = (p: string) => `${p}:displayName`;
 
@@ -38,6 +47,13 @@ function hashPeer(peerId: string): number {
   return h;
 }
 
+// Deterministic, order-independent key + role for a pair of peers, so both
+// sides write into the SAME trade record regardless of who scans first.
+function pairKey(p1: string, p2: string): { key: string; a: string; b: string } {
+  const [a, b] = p1 < p2 ? [p1, p2] : [p2, p1];
+  return { key: `${a}|${b}`, a, b };
+}
+
 export function Feature({ room, config }: Props) {
   if (!room) {
     return (
@@ -62,7 +78,7 @@ function Body({ room, config }: { room: YRoom; config: MeshConfig }) {
 
   useEffect(() => {
     const h = room.doc.getMap<Holding>("holdings");
-    const t = room.doc.getArray<TradeOffer>("offers");
+    const t = room.doc.getMap<Trade>("trades");
     const cb = () => rerender((n) => n + 1);
     h.observe(cb);
     t.observe(cb);
@@ -73,7 +89,7 @@ function Body({ room, config }: { room: YRoom; config: MeshConfig }) {
   }, [room]);
 
   const holdings = room.doc.getMap<Holding>("holdings");
-  const offers = room.doc.getArray<TradeOffer>("offers");
+  const trades = room.doc.getMap<Trade>("trades");
 
   // initial deal: each peer gets a card deterministic from peerId
   useEffect(() => {
@@ -93,44 +109,55 @@ function Body({ room, config }: { room: YRoom; config: MeshConfig }) {
   const my = holdings.get(room.peerId);
   const myCard = my ? CARDS[my.cardId] : null;
 
-  const proposeTrade = (otherId: string) => {
+  // Confirm my side of a trade with `otherId`. The swap only executes once
+  // BOTH peers have confirmed the same pending trade — a one-sided confirm
+  // records intent but never moves a card.
+  const confirmTrade = (otherId: string) => {
     if (!my || otherId === room.peerId) return;
     if (!holdings.has(otherId)) return;
-    // dedupe outgoing offer
-    if (offers.toArray().some((o) => o.from === room.peerId && o.to === otherId)) return;
-    offers.push([{ from: room.peerId, to: otherId, ts: Date.now() }]);
-  };
-
-  const accept = (from: string) => {
-    if (!my) return;
-    const theirHolding = holdings.get(from);
-    if (!theirHolding) return;
+    const { key, a, b } = pairKey(room.peerId, otherId);
     room.doc.transact(() => {
-      // swap
-      holdings.set(from, { ...theirHolding, cardId: my.cardId });
-      holdings.set(room.peerId, { ...my, cardId: theirHolding.cardId });
-      // remove their offer to me + any reverse offer
-      const arr = offers.toArray();
-      for (let i = arr.length - 1; i >= 0; i--) {
-        const o = arr[i]!;
-        if ((o.from === from && o.to === room.peerId) || (o.from === room.peerId && o.to === from))
-          offers.delete(i, 1);
+      const existing = trades.get(key);
+      if (existing?.done) return; // already settled this pair
+      const iAmA = room.peerId === a;
+      const next: Trade = existing
+        ? { ...existing }
+        : { a, b, confirmA: false, confirmB: false, ts: Date.now() };
+      if (iAmA) next.confirmA = true;
+      else next.confirmB = true;
+
+      if (next.confirmA && next.confirmB) {
+        // Mutual confirm reached → perform the swap exactly once.
+        const ha = holdings.get(a);
+        const hb = holdings.get(b);
+        if (ha && hb) {
+          holdings.set(a, { ...ha, cardId: hb.cardId });
+          holdings.set(b, { ...hb, cardId: ha.cardId });
+        }
+        next.done = true;
       }
+      trades.set(key, next);
     });
   };
 
-  const decline = (from: string) => {
-    const arr = offers.toArray();
-    for (let i = arr.length - 1; i >= 0; i--) {
-      const o = arr[i]!;
-      if (o.from === from && o.to === room.peerId) offers.delete(i, 1);
-    }
+  const cancelTrade = (otherId: string) => {
+    const { key } = pairKey(room.peerId, otherId);
+    const existing = trades.get(key);
+    if (existing && !existing.done) trades.delete(key);
   };
 
   const myPayload = makeScanPayload(room.roomId, room.peerId, name.trim() || "anon");
 
-  const inbound = offers.toArray().filter((o) => o.to === room.peerId);
-  const outbound = offers.toArray().filter((o) => o.from === room.peerId);
+  // Pending trades that involve me and are not yet settled.
+  const myPending: Array<{ otherId: string; trade: Trade; iConfirmed: boolean }> = [];
+  trades.forEach((tr, key) => {
+    if (tr.done) return;
+    if (tr.a !== room.peerId && tr.b !== room.peerId) return;
+    const otherId = tr.a === room.peerId ? tr.b : tr.a;
+    const iConfirmed = tr.a === room.peerId ? tr.confirmA : tr.confirmB;
+    void key;
+    myPending.push({ otherId, trade: tr, iConfirmed });
+  });
 
   const inventory = useMemo(() => {
     const set = new Set<number>();
@@ -173,28 +200,44 @@ function Body({ room, config }: { room: YRoom; config: MeshConfig }) {
 
       <QRExchange
         myPayload={myPayload}
-        showLabel="your QR — show to propose a trade"
-        scanLabel="scan to propose a trade"
-        onScan={(parsed) => proposeTrade(parsed.peerId)}
+        showLabel="your QR — show to start a trade"
+        scanLabel="scan to confirm a trade"
+        onScan={(parsed) => confirmTrade(parsed.peerId)}
       />
 
       <section>
-        <h2 className="viral-section-title">offers to you ({inbound.length})</h2>
-        {inbound.length === 0 ? (
-          <p className="viral-empty">none</p>
+        <h2 className="viral-section-title">pending trades ({myPending.length})</h2>
+        {myPending.length === 0 ? (
+          <p className="viral-empty">
+            none — scan a peer's QR (or use the confirm button) to start one
+          </p>
         ) : (
           <ul className="tc-offers">
-            {inbound.map((o) => {
-              const them = holdings.get(o.from);
+            {myPending.map(({ otherId, trade, iConfirmed }) => {
+              const them = holdings.get(otherId);
               const theirCard = them ? CARDS[them.cardId] : null;
+              const otherConfirmed = trade.a === otherId ? trade.confirmA : trade.confirmB;
               return (
-                <li key={o.from}>
-                  <strong>{them?.name ?? "?"}</strong> offers their <em>{theirCard?.name}</em>{" "}
-                  <button type="button" className="viral-primary" onClick={() => accept(o.from)}>
-                    accept
-                  </button>{" "}
-                  <button type="button" className="viral-ghost" onClick={() => decline(o.from)}>
-                    decline
+                <li key={otherId} className="tc-trade" data-peer={otherId}>
+                  <strong>{them?.name ?? "?"}</strong> · <em>{theirCard?.name ?? "?"}</em>{" "}
+                  <span className="tc-trade-status">
+                    {iConfirmed ? "you ✓" : "you ✗"} · {otherConfirmed ? "them ✓" : "them ✗"}
+                  </span>{" "}
+                  {!iConfirmed && (
+                    <button
+                      type="button"
+                      className="viral-primary tc-confirm"
+                      onClick={() => confirmTrade(otherId)}
+                    >
+                      confirm
+                    </button>
+                  )}{" "}
+                  <button
+                    type="button"
+                    className="viral-ghost tc-cancel"
+                    onClick={() => cancelTrade(otherId)}
+                  >
+                    cancel
                   </button>
                 </li>
               );
@@ -202,17 +245,6 @@ function Body({ room, config }: { room: YRoom; config: MeshConfig }) {
           </ul>
         )}
       </section>
-
-      {outbound.length > 0 && (
-        <section>
-          <h2 className="viral-section-title">your pending offers</h2>
-          <ul className="viral-tags">
-            {outbound.map((o) => (
-              <li key={o.to}>→ {holdings.get(o.to)?.name ?? o.to.slice(0, 6)}</li>
-            ))}
-          </ul>
-        </section>
-      )}
 
       <section>
         <h2 className="viral-section-title">all holdings</h2>

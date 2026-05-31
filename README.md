@@ -1,7 +1,7 @@
 # mesh-trade-cards
 
 [![pages](https://img.shields.io/badge/live-baditaflorin.github.io%2Fmesh-trade-cards-7e22ce)](https://baditaflorin.github.io/mesh-trade-cards/)
-[![version](https://img.shields.io/badge/version-0.1.0-blue)](https://github.com/baditaflorin/mesh-trade-cards/blob/main/package.json)
+[![version](https://img.shields.io/badge/version-0.1.1-blue)](https://github.com/baditaflorin/mesh-trade-cards/blob/main/package.json)
 [![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
 > Each peer is dealt one unique collectible card — trade via QR + mutual confirm
